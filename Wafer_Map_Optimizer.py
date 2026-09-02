@@ -1,4 +1,5 @@
 import io
+import math
 import os
 import sys
 
@@ -69,11 +70,19 @@ class FinalWaferAnalyzer(QMainWindow):
         self.stats_labels = {}
         self.current_layout = None
         self.current_params = None
+        self.current_mode = 'auto'
         self._base_xlim = None
         self._base_ylim = None
         self._dist_visible = [False] * 8
         self._dist_artists = []
         self._hover_text = None
+
+        # 布局导出库（gdstk，GDS/OAS 写入）
+        try:
+            import gdstk
+            self._gdstk = gdstk
+        except ImportError:
+            self._gdstk = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -189,26 +198,33 @@ class FinalWaferAnalyzer(QMainWindow):
         layout = QVBoxLayout()
 
         self.min_dist_btn = QPushButton("Show/Hide min Distance")
-        self.min_dist_btn.setFixedHeight(45)
+        self.min_dist_btn.setFixedHeight(36)
         self.min_dist_btn.setCheckable(True)
         self.min_dist_btn.setChecked(False)
         self.min_dist_btn.clicked.connect(self.on_min_dist_toggled)
         layout.addWidget(self.min_dist_btn)
 
         copy_btn = QPushButton("Copy to Clipboard")
-        copy_btn.setFixedHeight(45)
+        copy_btn.setFixedHeight(36)
         copy_btn.clicked.connect(self.copy_to_clipboard)
         layout.addWidget(copy_btn)
 
         export_img_btn = QPushButton("Export Image")
-        export_img_btn.setFixedHeight(45)
+        export_img_btn.setFixedHeight(36)
         export_img_btn.clicked.connect(self.export_image)
         layout.addWidget(export_img_btn)
 
         export_sinf_btn = QPushButton("Export SINF3D")
-        export_sinf_btn.setFixedHeight(45)
+        export_sinf_btn.setFixedHeight(36)
         export_sinf_btn.clicked.connect(self.export_sinf)
         layout.addWidget(export_sinf_btn)
+
+        export_layout_btn = QPushButton("Export GDS/OAS")
+        export_layout_btn.setFixedHeight(36)
+        export_layout_btn.clicked.connect(self.export_layout)
+        if self._gdstk is None:
+            export_layout_btn.setEnabled(False)
+        layout.addWidget(export_layout_btn)
 
         return layout
 
@@ -751,9 +767,128 @@ class FinalWaferAnalyzer(QMainWindow):
 
         return "\n".join(content)
 
+    def export_layout(self):
+        """导出 GDS/OAS 工程文件（默认格式 OAS）"""
+        if self._gdstk is None:
+            QMessageBox.warning(self, "Warning", "未安装 gdstk，无法导出 GDS/OAS")
+            return
+        if not self.current_layout or self.current_layout['count'] == 0:
+            QMessageBox.warning(self, "Warning", "Please generate a map first")
+            return
+
+        file_path, sel_filter = QFileDialog.getSaveFileName(
+            self, "Export Layout", "wafer_map", "OASIS (*.oas);;GDSII (*.gds)"
+        )
+        if not file_path:
+            return
+        # 未带扩展名时按所选过滤器补齐
+        if "." not in os.path.basename(file_path):
+            file_path += ".gds" if "GDSII" in sel_filter else ".oas"
+
+        try:
+            gdstk = self._gdstk
+            params = self.current_params
+            chip_x, chip_y = params['chip_x'], params['chip_y']
+            wafer_radius = params['wafer_dia'] / 2
+            edge_excl = params['edge_excl']
+
+            # unit=1e-3 m（mm），precision=1e-9 m（nm）
+            lib = gdstk.Library(unit=1e-3, precision=1e-9)
+
+            # Chip 单元：单颗芯片矩形轮廓（layer 101 / datatype 0）
+            chip_cell = lib.new_cell("Chip")
+            chip_cell.add(gdstk.rectangle((-chip_x / 2, -chip_y / 2),
+                                          (chip_x / 2, chip_y / 2),
+                                          layer=101, datatype=0))
+
+            # TOP 单元：引用所有芯片 + Wafer/EE 轮廓 + Notch
+            top = lib.new_cell("TOP")
+            for (x, y) in self.current_layout['coord_map'].keys():
+                top.add(gdstk.Reference(chip_cell, origin=(x, y)))
+
+            # Wafer 轮廓：360 点多边形，并切除 SEMI-M1 标准 Notch
+            self._add_wafer_with_notch(gdstk, top, params['notch_angle'], wafer_radius)
+            # EE 轮廓：360 点多边形
+            ee_r = wafer_radius - edge_excl
+            top.add(gdstk.regular_polygon(
+                (0, 0), 2 * ee_r * math.sin(math.pi / 360), 360,
+                layer=201, datatype=0))
+
+            if file_path.lower().endswith('.gds'):
+                lib.write_gds(file_path)
+            else:
+                lib.write_oas(file_path)
+            QMessageBox.information(self, "Success", f"Layout exported: {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
+    def _add_wafer_with_notch(self, gdstk, cell, angle, wafer_radius):
+        """Wafer 层（200/0）360 点多边形，并按 SEMI-M1 切除 Notch
+
+        Notch 规格：V 型缺口、夹角 90°（槽两侧相对径向各 45°）、
+        径向切深 1.0 mm、槽底圆角 R=0.2 mm。
+        """
+        wafer_poly = gdstk.regular_polygon(
+            (0, 0), 2 * wafer_radius * math.sin(math.pi / 360), 360,
+            layer=200, datatype=0)
+
+        angle_dict = {"0": 90, "90": 0, "180": 270, "270": 180}
+        theta0 = np.radians(angle_dict[str(angle)])
+        depth = 1.0            # 径向切深 (mm)
+        r_fillet = 0.2         # 槽底圆角半径 (mm)
+        margin = 0.5           # 开口端略超出晶圆边缘，保证差集干净
+        u = (math.cos(theta0), math.sin(theta0))   # 径向（指向缺口）
+        v = (-math.sin(theta0), math.cos(theta0))  # 切向
+
+        def _unit(ux, uy):
+            norm = math.hypot(ux, uy)
+            return (ux / norm, uy / norm)
+
+        # 槽底最深点与表面开口两端（局部坐标：u 径向、v 切向）
+        a_pt = ((wafer_radius - depth) * u[0], (wafer_radius - depth) * u[1])
+        b_pt = ((wafer_radius + margin) * u[0] + depth * v[0],
+                (wafer_radius + margin) * u[1] + depth * v[1])
+        c_pt = ((wafer_radius + margin) * u[0] - depth * v[0],
+                (wafer_radius + margin) * u[1] - depth * v[1])
+
+        e1 = _unit(b_pt[0] - a_pt[0], b_pt[1] - a_pt[1])  # 槽壁方向（B 侧）
+        e2 = _unit(c_pt[0] - a_pt[0], c_pt[1] - a_pt[1])  # 槽壁方向（C 侧）
+        # 圆角圆心沿角平分线（径向向外），距槽底 r/sin45°
+        center = (a_pt[0] + u[0] * r_fillet / math.sin(math.pi / 4),
+                  a_pt[1] + u[1] * r_fillet / math.sin(math.pi / 4))
+        t1 = (a_pt[0] + e1[0] * r_fillet, a_pt[1] + e1[1] * r_fillet)
+        t2 = (a_pt[0] + e2[0] * r_fillet, a_pt[1] + e2[1] * r_fillet)
+
+        # 底部圆弧（t1 -> t2，跨 90°）
+        a1 = math.atan2(t1[1] - center[1], t1[0] - center[0])
+        a2 = math.atan2(t2[1] - center[1], t2[0] - center[0])
+        da = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
+        arc_pts = [
+            (center[0] + r_fillet * math.cos(a1 + da * i / 12),
+             center[1] + r_fillet * math.sin(a1 + da * i / 12))
+            for i in range(13)
+        ]
+
+        notch_poly = gdstk.Polygon([b_pt, t1] + arc_pts + [t2, c_pt],
+                                   layer=200, datatype=0)
+        try:
+            result = gdstk.boolean(wafer_poly, notch_poly, 'not',
+                                   layer=200, datatype=0)
+            for poly in result:
+                # 移除圆角与槽壁衔接的两个切点（t1/t2），使轮廓仅保留圆角圆弧
+                # 注：gdstk 布尔运算输出坐标量化到 1e-3mm，容差取 1e-3 覆盖量化误差
+                pts = [
+                    p for p in poly.points
+                    if not (abs(p[0] - t1[0]) < 1e-3 and abs(p[1] - t1[1]) < 1e-3)
+                    and not (abs(p[0] - t2[0]) < 1e-3 and abs(p[1] - t2[1]) < 1e-3)
+                ]
+                cell.add(gdstk.Polygon(pts, layer=200, datatype=0))
+        except Exception:
+            cell.add(wafer_poly)  # 布尔运算失败时回退为完整晶圆轮廓
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = FinalWaferAnalyzer()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
